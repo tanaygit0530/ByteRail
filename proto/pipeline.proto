@@ -1,0 +1,36 @@
+syntax = "proto3";
+
+package pipeline;
+
+option go_package = "byterail/pkg/proto/pipeline";
+
+message Event {
+  string id = 1;
+  int64 timestamp = 2;
+  string user_id = 3;
+  repeated Item items = 4;
+  map<string, string> metadata = 5;
+  string discount_code = 6;
+}
+
+message Item {
+  string sku = 1;
+  int32 qty = 2;
+  double price = 3;
+}
+
+message BatchRequest {
+  repeated Event events = 1;
+  string correlation_id = 2;
+}
+
+message BatchResponse {
+  int32 processed = 1;
+  int64 processing_time_ns = 2;
+  string status = 3;
+}
+
+service EventPipeline {
+  rpc ProcessBatch (BatchRequest) returns (BatchResponse);
+  rpc ProcessBatchStream (stream BatchRequest) returns (stream BatchResponse);
+}

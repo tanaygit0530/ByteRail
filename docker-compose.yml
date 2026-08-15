@@ -1,0 +1,51 @@
+services:
+  order-service:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile.order
+    ports:
+      - "50051:50051"
+      - "8081:8081"
+    environment:
+      - GRPC_PORT=50051
+      - HTTP_PORT=8081
+
+  inventory-service:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile.inventory
+    ports:
+      - "50052:50052"
+      - "8082:8082"
+    environment:
+      - GRPC_PORT=50052
+      - HTTP_PORT=8082
+
+  gateway:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile.gateway
+    ports:
+      - "8080:8080"
+    environment:
+      - PORT=8080
+      - ORDER_GRPC_ADDR=order-service:50051
+      - ORDER_HTTP_ADDR=http://order-service:8081
+      - DB_PATH=/app/data/byterail_history.db
+    volumes:
+      - byterail_sqlite_data:/app/data
+    depends_on:
+      - order-service
+      - inventory-service
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "3001:3000"
+    depends_on:
+      - gateway
+
+volumes:
+  byterail_sqlite_data:

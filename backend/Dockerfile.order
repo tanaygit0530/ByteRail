@@ -1,0 +1,20 @@
+FROM golang:1.22-alpine AS builder
+
+RUN apk add --no-cache protobuf-dev protoc
+
+WORKDIR /app
+COPY backend/go.mod backend/go.sum ./
+COPY proto ./proto
+COPY backend ./
+
+RUN go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.34.1
+RUN go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.3.0
+RUN protoc --go_out=. --go_opt=module=byterail --go-grpc_out=. --go-grpc_opt=module=byterail proto/pipeline.proto
+RUN go mod tidy
+RUN CGO_ENABLED=0 GOOS=linux go build -o /order ./cmd/order
+
+FROM alpine:latest
+WORKDIR /app
+COPY --from=builder /order /app/order
+EXPOSE 50051 8081
+ENTRYPOINT ["/app/order"]
