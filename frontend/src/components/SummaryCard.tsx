@@ -27,8 +27,10 @@ export const SummaryCard: React.FC<SummaryCardProps> = ({ history }) => {
   const hasBinaryRps = binaryRps > 0;
   const hasJsonCpu = jsonCpu > 0;
   const hasBinaryCpu = binaryCpu > 0;
+  const hasJsonLatency = jsonP50 > 0 || jsonP99 > 0;
+  const hasBinaryLatency = binaryP50 > 0 || binaryP99 > 0;
 
-  const hasCompleteMetrics = hasJsonRps && hasBinaryRps && hasJsonCpu && hasBinaryCpu;
+  const hasCompleteMetrics = hasJsonRps && hasBinaryRps && hasJsonCpu && hasBinaryCpu && hasJsonLatency && hasBinaryLatency;
 
   const cpuSavedPct = (hasJsonCpu && hasBinaryCpu && jsonCpu > 0)
     ? ((jsonCpu - binaryCpu) / jsonCpu) * 100
@@ -41,20 +43,29 @@ export const SummaryCard: React.FC<SummaryCardProps> = ({ history }) => {
   // Individual Metric Winners
   const cpuWinner = !hasJsonCpu || !hasBinaryCpu ? "Awaiting Data" : binaryCpu < jsonCpu ? "Binary" : "JSON";
   const rpsWinner = !hasJsonRps || !hasBinaryRps ? "Awaiting Data" : binaryRps > jsonRps ? "Binary" : "JSON";
-  const p50Winner = jsonP50 === 0 || binaryP50 === 0 ? "Awaiting Data" : binaryP50 < jsonP50 ? "Binary" : "JSON";
-  const p95Winner = jsonP95 === 0 || binaryP95 === 0 ? "Awaiting Data" : binaryP95 < jsonP95 ? "Binary" : "JSON";
-  const p99Winner = jsonP99 === 0 || binaryP99 === 0 ? "Awaiting Data" : binaryP99 < jsonP99 ? "Binary" : "JSON";
+  const p50Winner = !hasJsonLatency || !hasBinaryLatency ? "Awaiting Data" : binaryP50 < jsonP50 ? "Binary" : "JSON";
+  const p95Winner = !hasJsonLatency || !hasBinaryLatency ? "Awaiting Data" : binaryP95 < jsonP95 ? "Binary" : "JSON";
+  const p99Winner = !hasJsonLatency || !hasBinaryLatency ? "Awaiting Data" : binaryP99 < jsonP99 ? "Binary" : "JSON";
 
-  // Overall Winner Badge
-  let winnerBadgeText = "Benchmark Validation Required";
+  // Dynamic Overall Winner Badging (Requirement 8)
+  let winnerBadgeText = "Benchmark Validation In Progress";
   let winnerBadgeClass = "bg-amber-500/20 text-amber-400 border-amber-500/40";
 
   if (!hasCompleteMetrics) {
-    winnerBadgeText = "Benchmark Validation Required";
+    if (!hasJsonLatency && hasBinaryLatency) {
+      winnerBadgeText = "Awaiting JSON Latency Samples";
+    } else {
+      winnerBadgeText = "Benchmark Validation In Progress";
+    }
     winnerBadgeClass = "bg-amber-500/20 text-amber-400 border-amber-500/40";
   } else if (binaryRps > jsonRps && binaryCpu < jsonCpu) {
-    winnerBadgeText = "ByteRail Performance Winner";
-    winnerBadgeClass = "bg-emerald-500/20 text-emerald-400 border-emerald-500/40";
+    if (binaryP99 <= jsonP99) {
+      winnerBadgeText = "ByteRail Performance Winner";
+      winnerBadgeClass = "bg-emerald-500/20 text-emerald-400 border-emerald-500/40";
+    } else {
+      winnerBadgeText = "ByteRail Performance Winner — Mixed Latency Result";
+      winnerBadgeClass = "bg-cyan-500/20 text-cyan-400 border-cyan-500/40";
+    }
   } else if (jsonRps > binaryRps && jsonCpu < binaryCpu) {
     winnerBadgeText = "JSON Performance Winner";
     winnerBadgeClass = "bg-amber-500/20 text-amber-400 border-amber-500/40";
@@ -68,7 +79,11 @@ export const SummaryCard: React.FC<SummaryCardProps> = ({ history }) => {
   if (!hasCompleteMetrics) {
     headlineText = "Measuring path metrics... Run full benchmark sequence for complete validation.";
   } else if (binaryCpu < jsonCpu && binaryRps > jsonRps) {
-    headlineText = `Binary gRPC saved ${cpuSavedPct.toFixed(1)}% CPU and delivered ${throughputMult.toFixed(2)}x higher throughput`;
+    if (binaryP99 <= jsonP99) {
+      headlineText = `Binary gRPC saved ${cpuSavedPct.toFixed(1)}% CPU and delivered ${throughputMult.toFixed(2)}x higher throughput (${binaryP99.toFixed(1)}ms vs ${jsonP99.toFixed(1)}ms p99)`;
+    } else {
+      headlineText = `Binary gRPC delivered ${throughputMult.toFixed(2)}x higher throughput with lower CPU, while JSON achieved lower tail latency`;
+    }
   } else if (binaryCpu < jsonCpu && binaryRps <= jsonRps) {
     headlineText = `Binary gRPC saved ${cpuSavedPct.toFixed(1)}% CPU with ${throughputMult.toFixed(2)}x JSON throughput`;
   } else if (binaryCpu >= jsonCpu && binaryRps > jsonRps) {

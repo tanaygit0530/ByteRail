@@ -194,8 +194,8 @@ func (t *Tracker) Tick(phase string) TickMetrics {
 		rpsBin = instantRpsBin
 	}
 
-	// Extract active latency samples from 60-second window
-	windowDuration := 60 * time.Second
+	// Extract active latency samples from 10-minute window (retains samples across benchmark run)
+	windowDuration := 10 * time.Minute
 	jsonLats := extractValidLatencies(t.jsonSamples, windowDuration)
 	binLats := extractValidLatencies(t.binSamples, windowDuration)
 
