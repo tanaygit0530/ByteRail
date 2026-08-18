@@ -166,8 +166,6 @@ func (gw *Gateway) logRoutingDecision(headerVal, mode, rationale string) {
 }
 
 func (gw *Gateway) handleJSONBatch(w http.ResponseWriter, r *http.Request) {
-	start := time.Now()
-
 	var bodyBytes []byte
 	var err error
 
@@ -201,9 +199,6 @@ func (gw *Gateway) handleJSONBatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	lat := time.Since(start).Seconds() * 1000.0
-	gw.tracker.RecordRequest("json", lat, int64(len(bodyBytes)))
-
 	w.Header().Set("Content-Type", "application/json")
 	if r.Header.Get("X-ByteRail-Gzip") == "true" {
 		w.Header().Set("Content-Encoding", "gzip")
@@ -216,8 +211,6 @@ func (gw *Gateway) handleJSONBatch(w http.ResponseWriter, r *http.Request) {
 }
 
 func (gw *Gateway) handleBinaryBatch(w http.ResponseWriter, r *http.Request) {
-	start := time.Now()
-
 	bodyBytes, err := io.ReadAll(r.Body)
 	if err != nil {
 		http.Error(w, "error reading body", http.StatusBadRequest)
@@ -231,17 +224,11 @@ func (gw *Gateway) handleBinaryBatch(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Call internal Order Service over gRPC (Protobuf binary)
-	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
-	defer cancel()
-
-	pbResp, err := gw.grpcClient.ProcessBatch(ctx, &req)
+	pbResp, err := gw.grpcClient.ProcessBatch(r.Context(), &req)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("gRPC call failed: %v", err), http.StatusInternalServerError)
 		return
 	}
-
-	lat := time.Since(start).Seconds() * 1000.0
-	gw.tracker.RecordRequest("binary", lat, int64(len(bodyBytes)))
 
 	if r.Header.Get("Accept") == "application/x-protobuf" {
 		w.Header().Set("Content-Type", "application/x-protobuf")
@@ -305,25 +292,8 @@ func (gw *Gateway) startMetricsBroadcaster() {
 	defer ticker.Stop()
 
 	for range ticker.C {
-		simulatedCPUJSON := 0.0
-		simulatedCPUBinary := 0.0
-
-		if gw.loadGen.IsRunning() {
-			cfg := gw.loadGen.GetConfig()
-			switch cfg.PayloadProfile {
-			case "medium":
-				simulatedCPUJSON = float64(cfg.Concurrency) * 0.15
-				simulatedCPUBinary = float64(cfg.Concurrency) * 0.05
-			case "large":
-				simulatedCPUJSON = float64(cfg.Concurrency) * 0.22
-				simulatedCPUBinary = float64(cfg.Concurrency) * 0.08
-			default:
-				simulatedCPUJSON = float64(cfg.Concurrency) * 0.08
-				simulatedCPUBinary = float64(cfg.Concurrency) * 0.02
-			}
-		}
-
-		tick := gw.tracker.Tick(simulatedCPUJSON, simulatedCPUBinary)
+		phase := gw.loadGen.GetPhase()
+		tick := gw.tracker.Tick(phase)
 
 		gw.logsMu.Lock()
 		logsCopy := make([]RoutingLogEntry, len(gw.routingLogs))
@@ -335,6 +305,7 @@ func (gw *Gateway) startMetricsBroadcaster() {
 			"tick":         tick,
 			"routing_logs": logsCopy,
 			"is_running":   gw.loadGen.IsRunning(),
+			"phase":        phase,
 		}
 
 		msgBytes, err := json.Marshal(payload)
@@ -392,27 +363,47 @@ func (gw *Gateway) onBenchmarkComplete(cfg loadgen.Config) {
 		return
 	}
 
-	var totalCpuJSON, totalCpuBinary, totalRpsJSON, totalRpsBinary float64
+	var jsonCpuSum, jsonRpsSum float64
+	var binCpuSum, binRpsSum float64
+	var jsonCount, binCount float64
 	var maxP99JSON, maxP99Binary float64
-	count := float64(len(historyTicks))
 
 	for _, tick := range historyTicks {
-		totalCpuJSON += tick.JSON.CpuUsage
-		totalCpuBinary += tick.Binary.CpuUsage
-		totalRpsJSON += tick.JSON.RPS
-		totalRpsBinary += tick.Binary.RPS
-		if tick.JSON.P99 > maxP99JSON {
-			maxP99JSON = tick.JSON.P99
+		if tick.JSON.RPS > 0 || tick.JSON.CpuUsage > 0 {
+			jsonCpuSum += tick.JSON.CpuUsage
+			jsonRpsSum += tick.JSON.RPS
+			jsonCount++
+			if tick.JSON.P99 > maxP99JSON {
+				maxP99JSON = tick.JSON.P99
+			}
 		}
-		if tick.Binary.P99 > maxP99Binary {
-			maxP99Binary = tick.Binary.P99
+		if tick.Binary.RPS > 0 || tick.Binary.CpuUsage > 0 {
+			binCpuSum += tick.Binary.CpuUsage
+			binRpsSum += tick.Binary.RPS
+			binCount++
+			if tick.Binary.P99 > maxP99Binary {
+				maxP99Binary = tick.Binary.P99
+			}
 		}
 	}
 
-	avgCpuJSON := totalCpuJSON / count
-	avgCpuBinary := totalCpuBinary / count
-	avgRpsJSON := totalRpsJSON / count
-	avgRpsBinary := totalRpsBinary / count
+	avgCpuJSON := 0.0
+	if jsonCount > 0 {
+		avgCpuJSON = jsonCpuSum / jsonCount
+	}
+	avgCpuBinary := 0.0
+	if binCount > 0 {
+		avgCpuBinary = binCpuSum / binCount
+	}
+
+	avgRpsJSON := 0.0
+	if jsonCount > 0 {
+		avgRpsJSON = jsonRpsSum / jsonCount
+	}
+	avgRpsBinary := 0.0
+	if binCount > 0 {
+		avgRpsBinary = binRpsSum / binCount
+	}
 
 	cpuSavedPct := 0.0
 	if avgCpuJSON > 0 {

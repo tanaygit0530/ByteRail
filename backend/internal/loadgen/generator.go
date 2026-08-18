@@ -14,6 +14,7 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/protobuf/proto"
 
 	"byterail/pkg/metrics"
 	pb "byterail/pkg/proto/pipeline"
@@ -34,21 +35,31 @@ type LoadGenerator struct {
 	running      atomic.Bool
 	cancel       context.CancelFunc
 	config       Config
+	phase        atomic.Value // "idle", "warmup", "json", "binary"
 	tracker      *metrics.Tracker
 	routingLogCb func(message string)
 	onComplete   func(cfg Config)
 }
 
 func NewLoadGenerator(tracker *metrics.Tracker, routingLogCb func(string), onComplete func(Config)) *LoadGenerator {
-	return &LoadGenerator{
+	lg := &LoadGenerator{
 		tracker:      tracker,
 		routingLogCb: routingLogCb,
 		onComplete:   onComplete,
 	}
+	lg.phase.Store("idle")
+	return lg
 }
 
 func (lg *LoadGenerator) IsRunning() bool {
 	return lg.running.Load()
+}
+
+func (lg *LoadGenerator) GetPhase() string {
+	if p, ok := lg.phase.Load().(string); ok {
+		return p
+	}
+	return "idle"
 }
 
 func (lg *LoadGenerator) GetConfig() Config {
@@ -77,17 +88,19 @@ func (lg *LoadGenerator) Start(cfg Config) error {
 
 	lg.mu.Lock()
 	lg.config = cfg
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(cfg.DurationSec)*time.Second)
+	totalTimeSec := cfg.DurationSec + 4
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(totalTimeSec)*time.Second)
 	lg.cancel = cancel
 	lg.mu.Unlock()
 
 	lg.running.Store(true)
+	lg.phase.Store("warmup")
 	lg.tracker.Reset()
 
-	lg.routingLogCb(fmt.Sprintf("🚀 Starting Benchmark: Concurrency=%d, Profile=%s, Duration=%ds, Streaming=%v, Gzip=%v",
-		cfg.Concurrency, cfg.PayloadProfile, cfg.DurationSec, cfg.IsStreaming, cfg.IsGzip))
+	lg.routingLogCb(fmt.Sprintf("🚀 Starting Benchmark: Concurrency=%d, Profile=%s, PhaseDuration=%ds/path, Streaming=%v, Gzip=%v",
+		cfg.Concurrency, cfg.PayloadProfile, cfg.DurationSec/2, cfg.IsStreaming, cfg.IsGzip))
 
-	go lg.runWorkers(ctx, cfg)
+	go lg.runPhasedSequence(ctx, cfg)
 
 	return nil
 }
@@ -99,12 +112,14 @@ func (lg *LoadGenerator) Stop() {
 	}
 	lg.mu.Unlock()
 	lg.running.Store(false)
+	lg.phase.Store("idle")
 	lg.routingLogCb("🛑 Benchmark stopped by user.")
 }
 
-func (lg *LoadGenerator) runWorkers(ctx context.Context, cfg Config) {
+func (lg *LoadGenerator) runPhasedSequence(ctx context.Context, cfg Config) {
 	defer func() {
 		lg.running.Store(false)
+		lg.phase.Store("idle")
 		lg.routingLogCb("🏁 Benchmark finished.")
 		if lg.onComplete != nil {
 			lg.onComplete(cfg)
@@ -113,107 +128,71 @@ func (lg *LoadGenerator) runWorkers(ctx context.Context, cfg Config) {
 
 	sampleBatch := GenerateBatchPayload(cfg.PayloadProfile)
 	jsonBytes, _ := json.Marshal(sampleBatch)
+	protoBytes, _ := proto.Marshal(sampleBatch)
 
-	var wg sync.WaitGroup
 	client := &http.Client{
 		Transport: &http.Transport{
 			MaxIdleConnsPerHost: cfg.Concurrency * 2,
+			MaxIdleConns:        cfg.Concurrency * 4,
+			IdleConnTimeout:     90 * time.Second,
 		},
 		Timeout: 5 * time.Second,
 	}
 
-	// Launch parallel JSON path workers
-	for i := 0; i < cfg.Concurrency; i++ {
-		wg.Add(1)
-		go func(workerID int) {
-			defer wg.Done()
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				default:
-					start := time.Now()
-					var reqBody io.Reader = bytes.NewReader(jsonBytes)
-					contentLen := int64(len(jsonBytes))
+	// -------------------------------------------------------------
+	// PHASE 1: WARMUP (2 Seconds)
+	// -------------------------------------------------------------
+	lg.phase.Store("warmup")
+	lg.routingLogCb("🔥 Phase 1/3: Warming up JSON & Binary connections...")
+	warmupCtx, warmupCancel := context.WithTimeout(ctx, 2*time.Second)
+	lg.executeWorkerPool(warmupCtx, client, cfg, "json", jsonBytes, protoBytes, sampleBatch, true)
+	lg.executeWorkerPool(warmupCtx, client, cfg, "binary", jsonBytes, protoBytes, sampleBatch, true)
+	warmupCancel()
 
-					req, err := http.NewRequestWithContext(ctx, "POST", cfg.GatewayHTTP+"/json/batch", reqBody)
-					if err != nil {
-						time.Sleep(10 * time.Millisecond)
-						continue
-					}
-
-					req.Header.Set("Content-Type", "application/json")
-					if cfg.IsGzip {
-						req.Header.Set("X-ByteRail-Gzip", "true")
-						var buf bytes.Buffer
-						gw := gzip.NewWriter(&buf)
-						gw.Write(jsonBytes)
-						gw.Close()
-						reqBody = &buf
-						req, _ = http.NewRequestWithContext(ctx, "POST", cfg.GatewayHTTP+"/json/batch", reqBody)
-						req.Header.Set("Content-Type", "application/json")
-						req.Header.Set("Content-Encoding", "gzip")
-						req.Header.Set("X-ByteRail-Gzip", "true")
-						contentLen = int64(buf.Len())
-					}
-
-					resp, err := client.Do(req)
-					lat := time.Since(start).Seconds() * 1000.0
-					if err == nil {
-						io.Copy(io.Discard, resp.Body)
-						resp.Body.Close()
-						lg.tracker.RecordRequest("json", lat, contentLen)
-					} else {
-						time.Sleep(10 * time.Millisecond)
-					}
-				}
-			}
-		}(i)
+	if ctx.Err() != nil {
+		return
 	}
 
-	// Launch parallel Binary path workers
-	if cfg.IsStreaming {
+	phaseSec := cfg.DurationSec / 2
+	if phaseSec < 5 {
+		phaseSec = 5
+	}
+
+	// Reset tracker metrics after warmup
+	lg.tracker.Reset()
+
+	// -------------------------------------------------------------
+	// PHASE 2: JSON PATH MEASUREMENT
+	// -------------------------------------------------------------
+	lg.phase.Store("json")
+	lg.routingLogCb(fmt.Sprintf("📊 Phase 2/3: Measuring JSON Path (%ds)...", phaseSec))
+	jsonCtx, jsonCancel := context.WithTimeout(ctx, time.Duration(phaseSec)*time.Second)
+	lg.executeWorkerPool(jsonCtx, client, cfg, "json", jsonBytes, protoBytes, sampleBatch, false)
+	jsonCancel()
+
+	if ctx.Err() != nil {
+		return
+	}
+
+	time.Sleep(500 * time.Millisecond)
+
+	// -------------------------------------------------------------
+	// PHASE 3: BINARY PATH MEASUREMENT
+	// -------------------------------------------------------------
+	lg.phase.Store("binary")
+	lg.routingLogCb(fmt.Sprintf("⚡ Phase 3/3: Measuring Binary Path (%ds)...", phaseSec))
+	binCtx, binCancel := context.WithTimeout(ctx, time.Duration(phaseSec)*time.Second)
+	lg.executeWorkerPool(binCtx, client, cfg, "binary", jsonBytes, protoBytes, sampleBatch, false)
+	binCancel()
+}
+
+func (lg *LoadGenerator) executeWorkerPool(ctx context.Context, client *http.Client, cfg Config, pathType string, jsonBytes, protoBytes []byte, sampleBatch *pb.BatchRequest, isWarmup bool) {
+	var wg sync.WaitGroup
+
+	if pathType == "json" {
 		for i := 0; i < cfg.Concurrency; i++ {
 			wg.Add(1)
-			go func(workerID int) {
-				defer wg.Done()
-				conn, err := grpc.Dial(cfg.OrderGRPC, grpc.WithTransportCredentials(insecure.NewCredentials()))
-				if err != nil {
-					return
-				}
-				defer conn.Close()
-
-				grpcClient := pb.NewEventPipelineClient(conn)
-				stream, err := grpcClient.ProcessBatchStream(ctx)
-				if err != nil {
-					return
-				}
-
-				for {
-					select {
-					case <-ctx.Done():
-						stream.CloseSend()
-						return
-					default:
-						start := time.Now()
-						if err := stream.Send(sampleBatch); err != nil {
-							return
-						}
-						_, err := stream.Recv()
-						lat := time.Since(start).Seconds() * 1000.0
-						if err == nil {
-							lg.tracker.RecordRequest("binary", lat, 80)
-						} else {
-							return
-						}
-					}
-				}
-			}(i)
-		}
-	} else {
-		for i := 0; i < cfg.Concurrency; i++ {
-			wg.Add(1)
-			go func(workerID int) {
+			go func() {
 				defer wg.Done()
 				for {
 					select {
@@ -221,28 +200,136 @@ func (lg *LoadGenerator) runWorkers(ctx context.Context, cfg Config) {
 						return
 					default:
 						start := time.Now()
-						reqBody := bytes.NewReader(jsonBytes)
-						req, err := http.NewRequestWithContext(ctx, "POST", cfg.GatewayHTTP+"/binary/batch", reqBody)
+						var reqBody io.Reader = bytes.NewReader(jsonBytes)
+						contentLen := int64(len(jsonBytes))
+
+						req, err := http.NewRequestWithContext(ctx, "POST", cfg.GatewayHTTP+"/json/batch", reqBody)
 						if err != nil {
-							time.Sleep(10 * time.Millisecond)
+							time.Sleep(5 * time.Millisecond)
 							continue
 						}
 
 						req.Header.Set("Content-Type", "application/json")
-						req.Header.Set("Accept", "application/x-protobuf")
+						if cfg.IsGzip {
+							var buf bytes.Buffer
+							gw := gzip.NewWriter(&buf)
+							gw.Write(jsonBytes)
+							gw.Close()
+							reqBody = &buf
+							req, _ = http.NewRequestWithContext(ctx, "POST", cfg.GatewayHTTP+"/json/batch", reqBody)
+							req.Header.Set("Content-Type", "application/json")
+							req.Header.Set("Content-Encoding", "gzip")
+							req.Header.Set("X-ByteRail-Gzip", "true")
+							contentLen = int64(buf.Len())
+						}
 
 						resp, err := client.Do(req)
-						lat := time.Since(start).Seconds() * 1000.0
+						elapsed := time.Since(start)
+						latMs := float64(elapsed.Nanoseconds()) / 1e6
+
 						if err == nil {
 							io.Copy(io.Discard, resp.Body)
 							resp.Body.Close()
-							lg.tracker.RecordRequest("binary", lat, 45)
+							if !isWarmup {
+								lg.tracker.RecordRequest("json", latMs, contentLen, resp.StatusCode >= 400)
+							}
 						} else {
-							time.Sleep(10 * time.Millisecond)
+							if !isWarmup {
+								lg.tracker.RecordRequest("json", 0, contentLen, true)
+							}
+							time.Sleep(5 * time.Millisecond)
 						}
 					}
 				}
-			}(i)
+			}()
+		}
+	} else {
+		// Binary Path
+		if cfg.IsStreaming {
+			for i := 0; i < cfg.Concurrency; i++ {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					conn, err := grpc.Dial(cfg.OrderGRPC, grpc.WithTransportCredentials(insecure.NewCredentials()))
+					if err != nil {
+						return
+					}
+					defer conn.Close()
+
+					grpcClient := pb.NewEventPipelineClient(conn)
+					stream, err := grpcClient.ProcessBatchStream(ctx)
+					if err != nil {
+						return
+					}
+
+					for {
+						select {
+						case <-ctx.Done():
+							stream.CloseSend()
+							return
+						default:
+							start := time.Now()
+							if err := stream.Send(sampleBatch); err != nil {
+								if !isWarmup {
+									lg.tracker.RecordRequest("binary", 0, int64(len(protoBytes)), true)
+								}
+								return
+							}
+							_, err := stream.Recv()
+							elapsed := time.Since(start)
+							latMs := float64(elapsed.Nanoseconds()) / 1e6
+
+							if !isWarmup {
+								lg.tracker.RecordRequest("binary", latMs, int64(len(protoBytes)), err != nil)
+							}
+							if err != nil {
+								return
+							}
+						}
+					}
+				}()
+			}
+		} else {
+			for i := 0; i < cfg.Concurrency; i++ {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					for {
+						select {
+						case <-ctx.Done():
+							return
+						default:
+							start := time.Now()
+							reqBody := bytes.NewReader(jsonBytes)
+							req, err := http.NewRequestWithContext(ctx, "POST", cfg.GatewayHTTP+"/binary/batch", reqBody)
+							if err != nil {
+								time.Sleep(5 * time.Millisecond)
+								continue
+							}
+
+							req.Header.Set("Content-Type", "application/json")
+							req.Header.Set("Accept", "application/x-protobuf")
+
+							resp, err := client.Do(req)
+							elapsed := time.Since(start)
+							latMs := float64(elapsed.Nanoseconds()) / 1e6
+
+							if err == nil {
+								io.Copy(io.Discard, resp.Body)
+								resp.Body.Close()
+								if !isWarmup {
+									lg.tracker.RecordRequest("binary", latMs, int64(len(protoBytes)), resp.StatusCode >= 400)
+								}
+							} else {
+								if !isWarmup {
+									lg.tracker.RecordRequest("binary", 0, int64(len(protoBytes)), true)
+								}
+								time.Sleep(5 * time.Millisecond)
+							}
+						}
+					}
+				}()
+			}
 		}
 	}
 

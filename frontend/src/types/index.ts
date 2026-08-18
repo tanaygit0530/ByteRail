@@ -1,16 +1,25 @@
 export interface PathMetric {
   total_requests: number;
+  errors: number;
   rps: number;
   p50_ms: number;
   p95_ms: number;
   p99_ms: number;
   cpu_pct: number;
   bytes_total: number;
+  sample_count: number;
+}
+
+export interface FairnessResult {
+  is_valid: boolean;
+  reason: string;
 }
 
 export interface TickMetrics {
   timestamp: number;
+  phase: string; // "warmup", "json", "binary", "idle"
   active: boolean;
+  fairness: FairnessResult;
   json: PathMetric;
   binary: PathMetric;
 }
@@ -27,6 +36,7 @@ export interface WebSocketMessage {
   tick: TickMetrics;
   routing_logs: RoutingLogEntry[];
   is_running: boolean;
+  phase?: string;
 }
 
 export interface BenchmarkConfig {

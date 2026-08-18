@@ -29,7 +29,7 @@ export const PayloadWaterfall: React.FC = () => {
 
         <div className="flex items-center gap-2 bg-binary-main/10 border border-binary-main/30 px-3 py-1.5 rounded-lg text-xs font-mono text-binary-main">
           <CheckCircle2 className="w-4 h-4" />
-          <span>{data.saved_pct}% Payload Compression Saved</span>
+          <span>{data.saved_pct}% Payload Size Reduction</span>
         </div>
       </div>
 

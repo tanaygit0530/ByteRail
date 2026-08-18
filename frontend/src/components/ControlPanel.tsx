@@ -28,7 +28,7 @@ export const ControlPanel: React.FC<ControlPanelProps> = ({
             <Zap className="w-5 h-5 text-binary-main" />
             Benchmark Workload Controller
           </h2>
-          <p className="text-xs text-slate-400">Configure synthetic load parameters fired simultaneously at JSON and Binary paths</p>
+          <p className="text-xs text-slate-400">Configure synthetic load parameters fired sequentially in comparable benchmark phases</p>
         </div>
 
         <button
